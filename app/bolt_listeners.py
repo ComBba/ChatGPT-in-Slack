@@ -1175,6 +1175,82 @@ def display_chat_from_scratch_result(
             },
         )
 
+#
+# Translate a thread
+#
+def show_translate_option_modal(
+    ack: Ack,
+    client: WebClient,
+    body: dict,
+    context: BoltContext,
+):
+    ack()
+    openai_api_key = context.get("OPENAI_API_KEY")
+    message_text = body.get("message", {}).get("text", "")
+    view = {
+        "type": "modal",
+        "callback_id": "request-translation",
+        "title": {"type": "plain_text", "text": "Translate Message"},
+        "submit": {"type": "plain_text", "text": "Translate"},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"Do you want to translate the following message?\n\n>{message_text}"
+                },
+            }
+        ],
+        "private_metadata": json.dumps({
+            "channel": body["channel"]["id"],
+            "message_ts": body["message"]["ts"],
+            "text": message_text
+        })
+    }
+    client.views_open(trigger_id=body["trigger_id"], view=view)
+
+def translate_message(
+    ack: Ack,
+    body: dict,
+    context: BoltContext,
+    client: WebClient,
+    logger: logging.Logger,
+):
+    ack()
+    openai_api_key = context.get("OPENAI_API_KEY")
+    private_metadata = json.loads(body["view"]["private_metadata"])
+    channel = private_metadata["channel"]
+    message_ts = private_metadata["message_ts"]
+    text = private_metadata["text"]
+
+    try:
+        # 언어 감지 (대부분의 문자가 한국어일 경우 한국어로 판단)
+        is_korean = sum([ord(char) > 127 for char in text]) / len(text) > 0.5
+        target_language = "English" if is_korean else "Korean"
+        prompt = f"Translate the following message to {target_language}:\n\n{text}"
+
+        response = generate_chatgpt_response(
+            context=context,
+            logger=logger,
+            openai_api_key=openai_api_key,
+            prompt=prompt,
+            timeout_seconds=OPENAI_TIMEOUT_SECONDS,
+        )
+
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=message_ts,
+            text=f"Translated message:\n\n{response}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to translate message: {e}")
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=message_ts,
+            text=f":warning: Failed to translate message: {e}"
+        )
+
 
 def register_listeners(app: App):
     # Chat with the bot
@@ -1186,6 +1262,13 @@ def register_listeners(app: App):
     app.view("request-thread-summary")(
         ack=ack_summarize_options_modal_submission,
         lazy=[prepare_and_share_thread_summary],
+    )
+
+    # Translate a message
+    app.shortcut("translate-message")(show_translate_option_modal)
+    app.view("request-translation")(
+        ack=just_ack,
+        lazy=[translate_message],
     )
 
     # Use templates

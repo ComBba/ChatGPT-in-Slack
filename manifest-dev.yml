@@ -1,18 +1,22 @@
 display_information:
-  name: ChatGPT (dev)
+  name: ChatGPT for Slack by 2weeks.co (v.Dev)
 features:
   app_home:
     home_tab_enabled: true
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
   bot_user:
-    display_name: ChatGPT Bot (dev)
+    display_name: ChatGPT Bot(2weeks.dev)
     always_online: true
   shortcuts:
     - name: Summarize this thread
       type: message
       callback_id: summarize-thread
       description: Summarize the discussion in a thread
+    - name: Translate this message
+      type: message
+      callback_id: translate-message
+      description: Translate the selected message
 oauth_config:
   scopes:
     bot:
