@@ -1178,6 +1178,32 @@ def display_chat_from_scratch_result(
 #
 # Translate a thread
 #
+def adjust_private_metadata(metadata, max_length=2000):
+    # JSON으로 변환하여 초기 길이 측정
+    json_data = json.dumps(metadata, ensure_ascii=False)
+    initial_length = len(json_data)
+    
+    if initial_length > max_length:
+        # 길이가 max_length자를 초과하는 경우, text 필드를 적절히 줄임
+        excess_length = initial_length - max_length
+        
+        # text 필드에서 초과 길이만큼 문자를 제거
+        text_content = metadata["text"]
+        # 초과 길이 + 3("..."을 추가하기 위한 공간)
+        new_text_length = len(text_content) - excess_length - 3
+        
+        if new_text_length > 0:
+            # 새로운 text 길이가 양수인 경우, 문자열을 잘라내고 "..."을 추가
+            metadata["text"] = text_content[:new_text_length] + "..."
+        else:
+            # 새로운 text 길이가 0 이하인 경우, text를 비우고 경고 메시지만 추가
+            metadata["text"] = "Text is too long to display..."
+        
+        # 수정된 metadata를 다시 JSON으로 변환
+        json_data = json.dumps(metadata, ensure_ascii=False)
+    
+    return json_data
+
 def show_translate_option_modal(
     ack: Ack,
     client: WebClient,
@@ -1187,6 +1213,20 @@ def show_translate_option_modal(
     ack()
     openai_api_key = context.get("OPENAI_API_KEY")
     message_text = body.get("message", {}).get("text", "")
+
+    # Slack view에서 보여줄 메시지를 200자로 제한
+    display_text = message_text[:200] + "..." if len(message_text) > 200 else message_text
+
+    # private_metadata를 생성
+    metadata = {
+        "channel": body["channel"]["id"],
+        "message_ts": body["message"]["ts"],
+        "text": message_text  # 전체 텍스트를 저장
+    }
+    
+    # private_metadata 길이를 2000자 이하로 조정
+    private_metadata = adjust_private_metadata(metadata, max_length=2000)
+
     view = {
         "type": "modal",
         "callback_id": "request-translation",
@@ -1198,15 +1238,11 @@ def show_translate_option_modal(
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"Do you want to translate the following message?\n\n>{message_text}"
+                    "text": f"Do you want to translate the following message?\n\n>{display_text}"
                 },
             }
         ],
-        "private_metadata": json.dumps({
-            "channel": body["channel"]["id"],
-            "message_ts": body["message"]["ts"],
-            "text": message_text
-        })
+        "private_metadata": private_metadata
     }
     client.views_open(trigger_id=body["trigger_id"], view=view)
 
