@@ -1274,10 +1274,11 @@ def translate_message(
             timeout_seconds=OPENAI_TIMEOUT_SECONDS,
         )
 
+        user_id = context.actor_user_id or context.user_id
         client.chat_postMessage(
             channel=channel,
             thread_ts=message_ts,
-            text=f"Translated message:\n\n{response}"
+            text=f"<@{user_id}> translated message:\n\n{response}"
         )
     except Exception as e:
         logger.error(f"Failed to translate message: {e}")
