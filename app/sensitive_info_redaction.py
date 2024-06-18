@@ -1,4 +1,5 @@
 import re
+
 from app.env import (
     REDACT_EMAIL_PATTERN,
     REDACT_PHONE_PATTERN,

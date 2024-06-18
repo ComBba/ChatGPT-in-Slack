@@ -3,18 +3,18 @@ import threading
 import time
 import re
 import json
-from typing import List, Dict, Any, Generator, Tuple, Optional, Union
+from typing import List, Dict, Tuple, Optional, Union
 from importlib import import_module
 
-import openai
-from openai.error import Timeout
-from openai.openai_object import OpenAIObject
+from openai import OpenAI, Stream
+from openai.lib.azure import AzureOpenAI
+from openai.types import Completion
 import tiktoken
 
 from slack_bolt import BoltContext
 from slack_sdk.web import WebClient, SlackResponse
 
-from app.markdown import slack_to_markdown, markdown_to_slack
+from app.markdown_conversion import slack_to_markdown, markdown_to_slack
 from app.openai_constants import (
     MAX_TOKENS,
     GPT_3_5_TURBO_MODEL,
@@ -37,6 +37,8 @@ from app.openai_constants import (
     GPT_4_32K_0613_MODEL,
     GPT_4O_MODEL,
     GPT_4O_2024_05_13_MODEL,
+    MODEL_TOKENS,
+    MODEL_FALLBACKS,
 )
 from app.slack_ops import update_wip_message
 
@@ -104,10 +106,23 @@ def make_synchronous_openai_call(
     openai_api_base: str,
     openai_api_version: str,
     openai_deployment_id: str,
+    openai_organization_id: Optional[str],
     timeout_seconds: int,
-) -> OpenAIObject:
-    return openai.ChatCompletion.create(
-        api_key=openai_api_key,
+) -> Completion:
+    if openai_api_type == "azure":
+        client = AzureOpenAI(
+            api_key=openai_api_key,
+            api_version=openai_api_version,
+            azure_endpoint=openai_api_base,
+            azure_deployment=openai_deployment_id,
+        )
+    else:
+        client = OpenAI(
+            api_key=openai_api_key,
+            base_url=openai_api_base,
+            organization=openai_organization_id,
+        )
+    return client.chat.completions.create(
         model=model,
         messages=messages,
         top_p=1,
@@ -119,11 +134,7 @@ def make_synchronous_openai_call(
         logit_bias={},
         user=user,
         stream=False,
-        api_type=openai_api_type,
-        api_base=openai_api_base,
-        api_version=openai_api_version,
-        deployment_id=openai_deployment_id,
-        request_timeout=timeout_seconds,
+        timeout=timeout_seconds,
     )
 
 
@@ -138,13 +149,26 @@ def start_receiving_openai_response(
     openai_api_base: str,
     openai_api_version: str,
     openai_deployment_id: str,
+    openai_organization_id: Optional[str],
     function_call_module_name: Optional[str],
-) -> Generator[OpenAIObject, Any, None]:
+) -> Stream[Completion]:
     kwargs = {}
     if function_call_module_name is not None:
         kwargs["functions"] = import_module(function_call_module_name).functions
-    return openai.ChatCompletion.create(
-        api_key=openai_api_key,
+    if openai_api_type == "azure":
+        client = AzureOpenAI(
+            api_key=openai_api_key,
+            api_version=openai_api_version,
+            azure_endpoint=openai_api_base,
+            azure_deployment=openai_deployment_id,
+        )
+    else:
+        client = OpenAI(
+            api_key=openai_api_key,
+            base_url=openai_api_base,
+            organization=openai_organization_id,
+        )
+    return client.chat.completions.create(
         model=model,
         messages=messages,
         top_p=1,
@@ -156,10 +180,6 @@ def start_receiving_openai_response(
         logit_bias={},
         user=user,
         stream=True,
-        api_type=openai_api_type,
-        api_base=openai_api_base,
-        api_version=openai_api_version,
-        deployment_id=openai_deployment_id,
         **kwargs,
     )
 
@@ -171,7 +191,7 @@ def consume_openai_stream_to_write_reply(
     context: BoltContext,
     user_id: str,
     messages: List[Dict[str, Union[str, Dict[str, str]]]],
-    stream: Generator[OpenAIObject, Any, None],
+    stream: Stream[Completion],
     timeout_seconds: int,
     translate_markdown: bool,
 ):
@@ -189,11 +209,11 @@ def consume_openai_stream_to_write_reply(
         for chunk in stream:
             spent_seconds = time.time() - start_time
             if timeout_seconds < spent_seconds:
-                raise Timeout()
+                raise TimeoutError()
             # Some versions of the Azure OpenAI API return an empty choices array in the first chunk
             if context.get("OPENAI_API_TYPE") == "azure" and not chunk.choices:
                 continue
-            item = chunk.choices[0]
+            item = chunk.choices[0].model_dump()
             if item.get("finish_reason") is not None:
                 break
             delta = item.get("delta")
@@ -225,7 +245,7 @@ def consume_openai_stream_to_write_reply(
                 # Ignore function call suggestions after content has been received
                 if assistant_reply["content"] == "":
                     for k in function_call.keys():
-                        function_call[k] += delta["function_call"].get(k, "")
+                        function_call[k] += delta["function_call"].get(k) or ""
                     assistant_reply["function_call"] = function_call
 
         for t in threads:
@@ -258,6 +278,7 @@ def consume_openai_stream_to_write_reply(
                 openai_api_base=context.get("OPENAI_API_BASE"),
                 openai_api_version=context.get("OPENAI_API_VERSION"),
                 openai_deployment_id=context.get("OPENAI_DEPLOYMENT_ID"),
+                openai_organization_id=context["OPENAI_ORG_ID"],
                 function_call_module_name=function_call_module_name,
             )
             consume_openai_stream_to_write_reply(
@@ -345,9 +366,28 @@ def context_length(
         raise NotImplementedError(error)
 
 
-# Adapted from https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
+def encode_and_count_tokens(
+    value: Union[str, List[Dict[str, Union[str, Dict[str, str]]]], Dict[str, str]],
+    encoding: tiktoken.Encoding,
+) -> int:
+    if isinstance(value, str):
+        return len(encoding.encode(value))
+    elif isinstance(value, list):
+        return sum(encode_and_count_tokens(item, encoding) for item in value)
+    elif isinstance(value, dict):
+        return sum(
+            encode_and_count_tokens(v, encoding)
+            for k, v in value.items()
+            if k != "image_url"
+        )
+    return 0
+
+
+# Initially adapted from the following source code,
+# and then we customized it to support broader use cases
+# https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
 def calculate_num_tokens(
-    messages: List[Dict[str, Union[str, Dict[str, str]]]],
+    messages: List[Dict[str, Union[str, Dict[str, str], List[Dict[str, str]]]]],
     model: str = GPT_3_5_TURBO_0613_MODEL,
 ) -> int:
     """Returns the number of tokens used by a list of messages."""
@@ -355,66 +395,42 @@ def calculate_num_tokens(
         encoding = tiktoken.encoding_for_model(model)
     except KeyError:
         encoding = tiktoken.get_encoding("cl100k_base")
-    if model in {
-        GPT_3_5_TURBO_0613_MODEL,
-        GPT_3_5_TURBO_16K_0613_MODEL,
-        GPT_3_5_TURBO_1106_MODEL,
-        GPT_3_5_TURBO_0125_MODEL,
-        GPT_4_0314_MODEL,
-        GPT_4_32K_0314_MODEL,
-        GPT_4_0613_MODEL,
-        GPT_4_32K_0613_MODEL,
-        GPT_4_1106_PREVIEW_MODEL,
-        GPT_4_0125_PREVIEW_MODEL,
-        GPT_4_TURBO_PREVIEW_MODEL,
-        GPT_4_TURBO_2024_04_09_MODEL,
-        GPT_4O_2024_05_13_MODEL,
-    }:
-        tokens_per_message = 3
-        tokens_per_name = 1
-    elif model == GPT_3_5_TURBO_0301_MODEL:
-        tokens_per_message = (
-            4  # every message follows <|start|>{role/name}\n{content}<|end|>\n
-        )
-        tokens_per_name = -1  # if there's a name, the role is omitted
-    elif model == GPT_3_5_TURBO_MODEL:
-        # Note that GPT_3_5_TURBO_MODEL may change over time. Return num tokens assuming GPT_3_5_TURBO_0125_MODEL.
-        return calculate_num_tokens(messages, model=GPT_3_5_TURBO_0125_MODEL)
-    elif model == GPT_3_5_TURBO_16K_MODEL:
-        # Note that GPT_3_5_TURBO_16K_MODEL may change over time. Return num tokens assuming GPT_3_5_TURBO_16K_0613_MODEL.
-        return calculate_num_tokens(messages, model=GPT_3_5_TURBO_16K_0613_MODEL)
-    elif model == GPT_4_MODEL:
-        # Note that GPT_4_MODEL may change over time. Return num tokens assuming GPT_4_0613_MODEL.
-        return calculate_num_tokens(messages, model=GPT_4_0613_MODEL)
-    elif model == GPT_4_TURBO_MODEL:
-        # Note that GPT_4_TURBO_MODEL may change over time. Return num tokens assuming GPT_4_TURBO_2024_04_09_MODEL.
-        return calculate_num_tokens(messages, model=GPT_4_TURBO_2024_04_09_MODEL)
-    elif model == GPT_4_32K_MODEL:
-        # Note that GPT_4_32K_MODEL may change over time. Return num tokens assuming GPT_4_32K_0613_MODEL.
-        return calculate_num_tokens(messages, model=GPT_4_32K_0613_MODEL)
-    elif model == GPT_4O_MODEL:
-        # Note that GPT_4O_MODEL may change over time. Return num tokens assuming GPT_4O_2024_05_13_MODEL.
-        return calculate_num_tokens(messages, model=GPT_4O_2024_05_13_MODEL)
-    else:
+    num_tokens = 0
+
+    # Handle model-specific tokens per message and name
+    model_tokens: Optional[Tuple[int, int]] = MODEL_TOKENS.get(model, None)
+    if model_tokens is None:
+        fallback_result = None
+        if model in MODEL_FALLBACKS:
+            actual_model = MODEL_FALLBACKS[model]
+            fallback_result = calculate_num_tokens(messages, model=actual_model)
+        if fallback_result is not None:
+            return fallback_result
         error = (
             f"Calculating the number of tokens for model {model} is not yet supported. "
             "See https://github.com/openai/openai-python/blob/main/chatml.md "
             "for information on how messages are converted to tokens."
         )
         raise NotImplementedError(error)
-    num_tokens = 0
+
+    tokens_per_message, tokens_per_name = model_tokens
+
     for message in messages:
         num_tokens += tokens_per_message
         for key, value in message.items():
             if key == "function_call":
-                num_tokens += 1
-                num_tokens += len(encoding.encode(value["name"]))
-                num_tokens += len(encoding.encode(value["arguments"]))
+                num_tokens += (
+                    1
+                    + len(encoding.encode(value["name"]))
+                    + len(encoding.encode(value["arguments"]))
+                )
             else:
-                num_tokens += len(encoding.encode(value))
+                num_tokens += encode_and_count_tokens(value, encoding)
             if key == "name":
                 num_tokens += tokens_per_name
-    num_tokens += 3  # every reply is primed with <|start|>assistant<|message|>
+
+    num_tokens += 3  # every reply is primed with <|im_start|>assistant<|im_sep|>
+
     return num_tokens
 
 
@@ -483,18 +499,14 @@ def calculate_tokens_necessary_for_function_call(context: BoltContext) -> int:
         return _prompt_tokens_used_by_function_call_cache
 
     def _calculate_prompt_tokens(functions) -> int:
-        return openai.ChatCompletion.create(
-            api_key=context.get("OPENAI_API_KEY"),
+        client = create_openai_client(context)
+        return client.chat.completions.create(
             model=context.get("OPENAI_MODEL"),
             messages=[{"role": "user", "content": "hello"}],
             max_tokens=1024,
             user="system",
-            api_type=context.get("OPENAI_API_TYPE"),
-            api_base=context.get("OPENAI_API_BASE"),
-            api_version=context.get("OPENAI_API_VERSION"),
-            deployment_id=context.get("OPENAI_DEPLOYMENT_ID"),
             **({"functions": functions} if functions is not None else {}),
-        )["usage"]["prompt_tokens"]
+        ).model_dump()["usage"]["prompt_tokens"]
 
     # TODO: If there is a better way to calculate this, replace the logic with it
     module = import_module(function_call_module_name)
@@ -541,11 +553,12 @@ def generate_slack_thread_summary(
         openai_api_base=context["OPENAI_API_BASE"],
         openai_api_version=context["OPENAI_API_VERSION"],
         openai_deployment_id=context["OPENAI_DEPLOYMENT_ID"],
+        openai_organization_id=context["OPENAI_ORG_ID"],
         timeout_seconds=timeout_seconds,
     )
     spent_time = time.time() - start_time
     logger.debug(f"Making a summary took {spent_time} seconds")
-    return openai_response["choices"][0]["message"]["content"]
+    return openai_response.model_dump()["choices"][0]["message"]["content"]
 
 
 def generate_proofreading_result(
@@ -593,11 +606,12 @@ def generate_proofreading_result(
         openai_api_base=context["OPENAI_API_BASE"],
         openai_api_version=context["OPENAI_API_VERSION"],
         openai_deployment_id=context["OPENAI_DEPLOYMENT_ID"],
+        openai_organization_id=context["OPENAI_ORG_ID"],
         timeout_seconds=timeout_seconds,
     )
     spent_time = time.time() - start_time
     logger.debug(f"Proofreading took {spent_time} seconds")
-    return openai_response["choices"][0]["message"]["content"]
+    return openai_response.model_dump()["choices"][0]["message"]["content"]
 
 
 def generate_chatgpt_response(
@@ -631,8 +645,24 @@ def generate_chatgpt_response(
         openai_api_base=context["OPENAI_API_BASE"],
         openai_api_version=context["OPENAI_API_VERSION"],
         openai_deployment_id=context["OPENAI_DEPLOYMENT_ID"],
+        openai_organization_id=context["OPENAI_ORG_ID"],
         timeout_seconds=timeout_seconds,
     )
     spent_time = time.time() - start_time
     logger.debug(f"Proofreading took {spent_time} seconds")
-    return openai_response["choices"][0]["message"]["content"]
+    return openai_response.model_dump()["choices"][0]["message"]["content"]
+
+
+def create_openai_client(context: BoltContext) -> Union[OpenAI, AzureOpenAI]:
+    if context.get("OPENAI_API_TYPE") == "azure":
+        return AzureOpenAI(
+            api_key=context.get("OPENAI_API_KEY"),
+            api_version=context.get("OPENAI_API_VERSION"),
+            azure_endpoint=context.get("OPENAI_API_BASE"),
+            azure_deployment=context.get("OPENAI_DEPLOYMENT_ID"),
+        )
+    else:
+        return OpenAI(
+            api_key=context.get("OPENAI_API_KEY"),
+            base_url=context.get("OPENAI_API_BASE"),
+        )
