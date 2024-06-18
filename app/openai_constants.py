@@ -19,3 +19,37 @@ GPT_4_32K_0314_MODEL = "gpt-4-32k-0314"
 GPT_4_32K_0613_MODEL = "gpt-4-32k-0613"
 GPT_4O_MODEL = "gpt-4o"
 GPT_4O_2024_05_13_MODEL = "gpt-4o-2024-05-13"
+
+# Tuple: (tokens_per_message, tokens_per_name)
+MODEL_TOKENS = {
+    # GPT-3.5
+    GPT_3_5_TURBO_0613_MODEL: (3, 1),
+    GPT_3_5_TURBO_16K_0613_MODEL: (3, 1),
+    GPT_3_5_TURBO_1106_MODEL: (3, 1),
+    GPT_3_5_TURBO_0125_MODEL: (3, 1),
+    GPT_3_5_TURBO_0301_MODEL: (
+        4,  # every message follows <|start|>{role/name}\n{content}<|end|>\n
+        -1,  # if there's a name, the role is omitted
+    ),
+    # GPT-4
+    GPT_4_0314_MODEL: (3, 1),
+    GPT_4_32K_0314_MODEL: (3, 1),
+    GPT_4_0613_MODEL: (3, 1),
+    GPT_4_32K_0613_MODEL: (3, 1),
+    GPT_4_1106_PREVIEW_MODEL: (3, 1),
+    GPT_4_0125_PREVIEW_MODEL: (3, 1),
+    GPT_4_TURBO_PREVIEW_MODEL: (3, 1),
+    GPT_4_TURBO_2024_04_09_MODEL: (3, 1),
+    # GPT-4o
+    GPT_4O_2024_05_13_MODEL: (3, 1),
+}
+
+# Note that these fallbacks may change over time.
+MODEL_FALLBACKS = {
+    GPT_3_5_TURBO_MODEL: GPT_3_5_TURBO_0125_MODEL,
+    GPT_3_5_TURBO_16K_MODEL: GPT_3_5_TURBO_16K_0613_MODEL,
+    GPT_4_MODEL: GPT_4_0613_MODEL,
+    GPT_4_TURBO_MODEL: GPT_4_TURBO_2024_04_09_MODEL,
+    GPT_4_32K_MODEL: GPT_4_32K_0613_MODEL,
+    GPT_4O_MODEL: GPT_4O_2024_05_13_MODEL,
+}

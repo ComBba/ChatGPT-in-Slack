@@ -29,9 +29,13 @@ oauth_config:
       - chat:write.public
       - chat:write
       - users:read
+      - files:read
+      - files:write
+      - im:write
 settings:
   event_subscriptions:
     bot_events:
+      - app_home_opened
       - app_mention
       - message.channels
       - message.groups
